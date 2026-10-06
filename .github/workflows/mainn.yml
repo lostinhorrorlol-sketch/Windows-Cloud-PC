@@ -1,0 +1,134 @@
+name: PC Remoto AnyDesk
+
+on:
+  workflow_dispatch:
+    inputs:
+      duracao_minutos:
+        description: "Quanto tempo manter o PC ligado (máx. 350)"
+        default: "300"
+      senha_automatica:
+        description: "Gerar uma senha aleatória (mais seguro). Desmarcado = sem senha"
+        type: boolean
+        default: false
+      programas_extras:
+        description: "Programas extras para instalar, separados por espaço (ex: googlechrome 7zip vlc)"
+        default: "googlechrome"
+
+jobs:
+  remoto:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configurar PC (sem suspensão e programas extras)
+        shell: pwsh
+        env:
+          EXTRAS: ${{ inputs.programas_extras }}
+        run: |
+          # Nunca deixar a tela ou o PC desligar sozinhos
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # Programas extras via Chocolatey
+          if ($env:EXTRAS.Trim() -ne "") {
+            Write-Host "Instalando extras: $env:EXTRAS"
+            choco install $env:EXTRAS.Split(" ", [StringSplitOptions]::RemoveEmptyEntries) -y --no-progress
+          }
+
+      - name: Instalar AnyDesk
+        shell: pwsh
+        run: |
+          choco install anydesk -y --no-progress
+          $exe = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "AnyDesk nao encontrado. Procurando..."
+            Get-ChildItem "C:\Program Files*" -Recurse -Filter "AnyDesk.exe" -ErrorAction SilentlyContinue | Select-Object FullName
+            exit 1
+          }
+          Write-Host "AnyDesk instalado em $exe"
+
+      - name: Configurar acesso e obter ID
+        shell: pwsh
+        env:
+          SENHA_AUTOMATICA: ${{ inputs.senha_automatica }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          $exe = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+          $confDir = "C:\ProgramData\AnyDesk"
+          $conf = "$confDir\system.conf"
+
+          # Garante que o servico iniciou uma vez e criou as configuracoes
+          Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+          Start-Process $exe
+          Start-Sleep -Seconds 20
+
+          $senha = ""
+          if ($env:SENHA_AUTOMATICA -eq "true") {
+            # Modo seguro: senha aleatoria gerada a cada execucao
+            $senha = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
+            $senha | & $exe --set-password
+          } else {
+            # Modo sem senha: aceita conexoes automaticamente
+            Stop-Service -Name AnyDesk -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            if (-not (Test-Path $confDir)) { New-Item -ItemType Directory -Path $confDir | Out-Null }
+            Add-Content -Path $conf -Value "ad.security.interactive_access=2"
+            Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            Start-Process $exe
+            Start-Sleep -Seconds 15
+          }
+
+          # Tenta pegar o ID por ate 2 minutos
+          $id = ""
+          for ($i = 1; $i -le 24; $i++) {
+            $id = (& $exe --get-id | Out-String).Trim()
+            if ($id -match '^\d{6,}$') { break }
+            Write-Host "Aguardando ID... tentativa $i"
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not ($id -match '^\d{6,}$')) {
+            Write-Host "Nao foi possivel obter o ID. Valor recebido: '$id'"
+            Get-Service AnyDesk -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Write-Host "=============================="
+          Write-Host "ID DO ANYDESK: $id"
+          if ($senha -ne "") { Write-Host "SENHA: $senha" } else { Write-Host "SENHA: nenhuma (acesso automatico)" }
+          Write-Host "=============================="
+
+          # Resumo da execucao
+          "### ID do AnyDesk: ``$id``" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if ($senha -ne "") { "### Senha: ``$senha``" | Out-File -Append $env:GITHUB_STEP_SUMMARY }
+
+          # Aviso no Discord (opcional, so se o secret DISCORD_WEBHOOK existir)
+          if ($env:DISCORD_WEBHOOK) {
+            $msg = "PC remoto ligado! ID: $id"
+            if ($senha -ne "") { $msg += " | Senha: $senha" }
+            $body = @{ content = $msg } | ConvertTo-Json
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType "application/json" -Body $body
+          }
+
+      - name: Manter o PC ligado
+        shell: pwsh
+        env:
+          DURACAO: ${{ inputs.duracao_minutos }}
+        run: |
+          $minutos = [Math]::Min([int]$env:DURACAO, 350)
+          $fim = (Get-Date).AddMinutes($minutos)
+          while ((Get-Date) -lt $fim) {
+            $restante = [int]($fim - (Get-Date)).TotalMinutes
+            Write-Host "PC ativo... $(Get-Date -Format HH:mm:ss) | restam $restante min"
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "Tempo esgotado. Encerrando."
+
+      - name: Diagnostico (so se algo falhar)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Service AnyDesk -ErrorAction SilentlyContinue
+          $trace = "C:\ProgramData\AnyDesk\ad_svc.trace"
+          if (Test-Path $trace) { Get-Content $trace -Tail 60 }
