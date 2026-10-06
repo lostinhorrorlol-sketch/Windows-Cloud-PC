@@ -1,0 +1,308 @@
+name: PC Remoto AnyDesk
+
+on:
+  workflow_dispatch:
+    inputs:
+      duracao_minutos:
+        description: "Quanto tempo manter o PC ligado (máx. 350)"
+        default: "300"
+      sem_senha:
+        description: "Marque para NÃO usar senha (qualquer pessoa com o endereço entra). Desmarcado = senha aleatória"
+        type: boolean
+        default: false
+      instalar_roblox:
+        description: "Instalar o Roblox Studio"
+        type: boolean
+        default: true
+      programas_extras:
+        description: "Programas extras separados por espaço (ex: googlechrome 7zip vlc). Deixe vazio para nenhum"
+        default: "googlechrome"
+      session_id:
+        description: "Uso do site Cloud Virtual Pc (deixe vazio ao rodar manualmente)"
+        default: ""
+      callback_url:
+        description: "Uso do site Cloud Virtual Pc (deixe vazio ao rodar manualmente)"
+        default: ""
+      callback_token:
+        description: "Uso do site Cloud Virtual Pc (deixe vazio ao rodar manualmente)"
+        default: ""
+
+jobs:
+  remoto:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      SESSION_ID: ${{ inputs.session_id }}
+      CALLBACK_URL: ${{ inputs.callback_url }}
+      CALLBACK_TOKEN: ${{ inputs.callback_token }}
+      RUN_ID: ${{ github.run_id }}
+
+    steps:
+      - name: Preparar PC (sem suspensão, sem bloqueio, mais desempenho)
+        shell: pwsh
+        run: |
+          # Esconde o token do site nos logs
+          if ($env:CALLBACK_TOKEN) { Write-Host "::add-mask::$env:CALLBACK_TOKEN" }
+
+          # Funcao compartilhada para avisar o site Cloud Virtual Pc
+          $conteudo = @'
+          function Send-Report($dados) {
+            if (-not $env:CALLBACK_URL -or -not $env:SESSION_ID) { return }
+            $dados.session_id = $env:SESSION_ID
+            $dados.token = $env:CALLBACK_TOKEN
+            try {
+              $json = $dados | ConvertTo-Json
+              Invoke-RestMethod -Uri $env:CALLBACK_URL -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) | Out-Null
+            } catch {
+              Write-Host "Nao foi possivel avisar o site: $($_.Exception.Message)"
+            }
+          }
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\report.ps1" -Value $conteudo -Encoding UTF8
+          . "$env:RUNNER_TEMP\report.ps1"
+          Send-Report @{ status = "starting"; message = "Preparando o PC..." }
+
+          # Nunca deixar a tela ou o PC desligarem sozinhos
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # Sem tela de bloqueio e sem protetor de tela
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization" /v NoLockScreen /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null
+          reg add "HKCU\Control Panel\Desktop" /v ScreenSaverIsSecure /t REG_SZ /d 0 /f | Out-Null
+
+          # Mais desempenho: antivirus em tempo real desligado (a maquina e descartavel)
+          try { Set-MpPreference -DisableRealtimeMonitoring $true } catch { Write-Host "Nao foi possivel desligar o antivirus em tempo real." }
+
+      - name: Instalar Roblox Studio
+        if: ${{ inputs.instalar_roblox }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          . "$env:RUNNER_TEMP\report.ps1"
+          Send-Report @{ status = "starting"; message = "Instalando o Roblox Studio..." }
+
+          $versoes = Join-Path $env:LOCALAPPDATA "Roblox\Versions"
+          function Find-Studio {
+            if (Test-Path $versoes) {
+              return Get-ChildItem $versoes -Recurse -Filter "RobloxStudioBeta.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+            return $null
+          }
+
+          # Tentativa 1: winget, se existir no runner
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "Instalando pelo winget..."
+            winget install --id Roblox.RobloxStudio -e --silent --accept-package-agreements --accept-source-agreements
+          }
+
+          # Tentativa 2: instalador oficial da Roblox
+          if (-not (Find-Studio)) {
+            Write-Host "Baixando o instalador oficial..."
+            $inst = "$env:TEMP\RobloxStudioLauncherBeta.exe"
+            Invoke-WebRequest "https://setup.rbxcdn.com/RobloxStudioLauncherBeta.exe" -OutFile $inst
+            Start-Process $inst
+            # O instalador baixa e abre o Studio sozinho; esperamos ate 6 minutos
+            for ($i = 1; $i -le 36; $i++) {
+              if (Find-Studio) { break }
+              Write-Host "Aguardando o Roblox Studio... $($i * 10)s"
+              Start-Sleep -Seconds 10
+            }
+          }
+
+          $studio = Find-Studio
+          if (-not $studio) {
+            Write-Host "Roblox Studio nao foi instalado. O PC continua funcionando sem ele."
+            Send-Report @{ status = "starting"; message = "Nao foi possivel instalar o Roblox Studio. Continuando sem ele..." }
+            exit 1
+          }
+
+          Write-Host "Roblox Studio encontrado em $($studio.FullName)"
+          # Atalho na area de trabalho
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $sh = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\Roblox Studio.lnk")
+          $sh.TargetPath = $studio.FullName
+          $sh.Save()
+
+      - name: Instalar programas extras
+        continue-on-error: true
+        shell: pwsh
+        env:
+          EXTRAS: ${{ inputs.programas_extras }}
+        run: |
+          . "$env:RUNNER_TEMP\report.ps1"
+          $pkgs = @($env:EXTRAS -split '\s+' | Where-Object { $_ -ne "" })
+          if ($pkgs.Count -gt 0) {
+            Send-Report @{ status = "starting"; message = "Instalando programas extras..." }
+            Write-Host "Instalando extras: $($pkgs -join ', ')"
+            choco install @pkgs -y --no-progress
+          } else {
+            Write-Host "Nenhum programa extra."
+          }
+
+      - name: Instalar AnyDesk
+        shell: pwsh
+        run: |
+          . "$env:RUNNER_TEMP\report.ps1"
+          Send-Report @{ status = "starting"; message = "Instalando o AnyDesk..." }
+          choco install anydesk -y --no-progress
+          $exe = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "AnyDesk nao encontrado. Procurando..."
+            Get-ChildItem "C:\Program Files*" -Recurse -Filter "AnyDesk.exe" -ErrorAction SilentlyContinue | Select-Object FullName
+            exit 1
+          }
+          Write-Host "AnyDesk instalado em $exe"
+
+      - name: Configurar acesso e obter endereço
+        shell: pwsh
+        env:
+          SEM_SENHA: ${{ inputs.sem_senha }}
+          DURACAO: ${{ inputs.duracao_minutos }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          . "$env:RUNNER_TEMP\report.ps1"
+          $exe = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+          $confDir = "C:\ProgramData\AnyDesk"
+          $conf = "$confDir\system.conf"
+          $minutos = [Math]::Min([int]$env:DURACAO, 350)
+
+          Send-Report @{ status = "starting"; message = "Configurando o acesso remoto..." }
+
+          # Le o endereco do AnyDesk (por comando e, se falhar, pelo arquivo de configuracao)
+          function Get-AnyDeskAddress {
+            $bat = "$env:TEMP\ad_getid.bat"
+            Set-Content -Path $bat -Value "`"$exe`" --get-id | more" -Encoding ASCII
+            $out = (& cmd /c $bat | Out-String).Trim()
+            if ($out -match '^\d{6,}$') { return $out }
+            if (Test-Path $conf) {
+              $m = Select-String -Path $conf -Pattern '^ad\.anynet\.id=(\d+)' | Select-Object -First 1
+              if ($m) { return $m.Matches[0].Groups[1].Value }
+            }
+            return ""
+          }
+
+          # Inicia o servico e o programa
+          Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+          Start-Process $exe
+          Start-Sleep -Seconds 20
+
+          $senha = ""
+          if ($env:SEM_SENHA -eq "true") {
+            # Modo sem senha: aceita conexoes automaticamente
+            Stop-Service -Name AnyDesk -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            if (-not (Test-Path $confDir)) { New-Item -ItemType Directory -Path $confDir | Out-Null }
+            Add-Content -Path $conf -Value "ad.security.interactive_access=2"
+            Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            Start-Process $exe
+            Start-Sleep -Seconds 15
+          } else {
+            # Modo seguro: senha aleatoria gerada a cada execucao
+            $senha = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
+            $batSenha = "$env:TEMP\ad_setpw.bat"
+            # Sem espaco antes do pipe, senao a senha ganha um espaco no final
+            Set-Content -Path $batSenha -Value "echo $senha| `"$exe`" --set-password" -Encoding ASCII
+            & cmd /c $batSenha | Out-Null
+            Remove-Item $batSenha -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+          }
+
+          # Tenta pegar o endereco por ate 2 minutos
+          $addr = ""
+          for ($i = 1; $i -le 24; $i++) {
+            $addr = Get-AnyDeskAddress
+            if ($addr -ne "") { break }
+            Write-Host "Aguardando endereço... tentativa $i"
+            Start-Sleep -Seconds 5
+          }
+
+          if ($addr -eq "") {
+            Write-Host "Nao foi possivel obter o endereço do AnyDesk."
+            Get-Service AnyDesk -ErrorAction SilentlyContinue
+            if (Test-Path $conf) { Get-Content $conf }
+            Send-Report @{ status = "error"; message = "O AnyDesk nao gerou o endereco. Veja os logs do GitHub Actions." }
+            exit 1
+          }
+
+          Write-Host "=============================="
+          Write-Host "ENDEREÇO DO ANYDESK: $addr"
+          if ($senha -ne "") { Write-Host "SENHA: $senha" } else { Write-Host "SENHA: nenhuma (acesso automatico)" }
+          Write-Host "=============================="
+
+          # Resumo da execucao
+          "### Endereço do AnyDesk: ``$addr``" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if ($senha -ne "") { "### Senha: ``$senha``" | Out-File -Append $env:GITHUB_STEP_SUMMARY }
+
+          # Avisa o site Cloud Virtual Pc
+          Send-Report @{
+            status  = "running"
+            address = $addr
+            senha   = $senha
+            run_id  = $env:RUN_ID
+            ends_at = (Get-Date).ToUniversalTime().AddMinutes($minutos).ToString("o")
+          }
+
+          # Aviso no Discord (opcional, so se o secret DISCORD_WEBHOOK existir)
+          if ($env:DISCORD_WEBHOOK) {
+            $msg = "PC remoto ligado! Endereço: $addr"
+            if ($senha -ne "") { $msg += " | Senha: $senha" }
+            $body = @{ content = $msg } | ConvertTo-Json
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+          }
+
+      - name: Manter o PC ligado e acordado
+        shell: pwsh
+        env:
+          DURACAO: ${{ inputs.duracao_minutos }}
+        run: |
+          $minutos = [Math]::Min([int]$env:DURACAO, 350)
+          $fim = (Get-Date).AddMinutes($minutos)
+
+          # Mexe o mouse de leve para a sessao nunca "dormir" nem bloquear
+          Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+          $i = 0
+          while ((Get-Date) -lt $fim) {
+            $restante = [int]($fim - (Get-Date)).TotalMinutes
+            Write-Host "PC ativo... $(Get-Date -Format HH:mm:ss) | restam $restante min"
+
+            # Se o AnyDesk cair, religa o servico
+            $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") {
+              Write-Host "AnyDesk parou. Religando..."
+              Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            }
+
+            try {
+              $p = [System.Windows.Forms.Cursor]::Position
+              $dx = if ($i % 2 -eq 0) { 1 } else { -1 }
+              [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($p.X + $dx), $p.Y)
+            } catch {}
+            $i++
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "Tempo esgotado. Encerrando."
+
+      - name: Diagnóstico (só se algo falhar)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Service AnyDesk -ErrorAction SilentlyContinue
+          $trace = "C:\ProgramData\AnyDesk\ad_svc.trace"
+          if (Test-Path $trace) { Get-Content $trace -Tail 60 }
+
+      - name: Avisar o site que terminou
+        if: always()
+        shell: pwsh
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if (-not $env:CALLBACK_URL -or -not $env:SESSION_ID) { Write-Host "Execucao manual, sem site."; exit 0 }
+          if (-not (Test-Path "$env:RUNNER_TEMP\report.ps1")) { exit 0 }
+          . "$env:RUNNER_TEMP\report.ps1"
+          if ($env:JOB_STATUS -eq "failure") {
+            Send-Report @{ status = "error"; message = "O workflow falhou. Veja os logs no GitHub Actions." }
+          } else {
+            Send-Report @{ status = "finished"; message = "O tempo acabou e o PC foi desligado." }
+          }
